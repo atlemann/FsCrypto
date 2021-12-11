@@ -1,3 +1,4 @@
+open Argu
 open Coinbase
 open FsCrypto.Api.Firi
 open FsCrypto.Instructions
@@ -35,11 +36,15 @@ module Program =
 
     open FsToolkit.ErrorHandling
 
-    let run firiApi coinbaseClient program =
+    let run (firiApi:FiriApi option) (coinbaseClient:CoinbaseClient option) program =
         asyncSeq {
             //yield (Testing.run >> Async.map Ok)
-            yield Firi.run firiApi
-            yield (Coinbase.run coinbaseClient >> Async.map Ok)
+
+            if firiApi.IsSome then
+                yield Firi.run firiApi.Value
+
+            if coinbaseClient.IsSome then
+                yield (Coinbase.run coinbaseClient.Value >> Async.map Ok)
         }
         |> AsyncSeq.mapAsyncParallel (fun run -> run program)
         |> AsyncSeq.toListAsync
@@ -185,55 +190,70 @@ type Selection =
     | Balances
     | Quit
 
-let getEnvironmentVarOr varName defaultWith =
-    varName
-    |> Environment.GetEnvironmentVariable
-    |> Option.ofObj
-    |> Option.defaultWith defaultWith
+type CLIArguments =
+    | Firi of ClientId:string * Secret:string
+    | Coinbase of ApiKey:string * ApiSecret:string
+with
+    interface IArgParserTemplate with
+        member this.Usage =
+            match this with
+            | Firi _ -> "Use Firi"
+            | Coinbase _ -> "Use Coinbase"
 
 [<EntryPoint>]
 let main argv =
 
     AnsiConsole.Markup $"[mediumpurple3_1]{logo}[/]"
 
-    let firiClientId = getEnvironmentVarOr "FIRI_CLIENT_ID" (fun () -> argv.[0])
-    let firiSecret = getEnvironmentVarOr "FIRI_SECRET" (fun () -> argv.[1])
-    let coinbaseApiKey = getEnvironmentVarOr "COINBASE_API_KEY" (fun () -> argv.[2])
-    let coinbaseApiSecret = getEnvironmentVarOr "COINBASE_API_SECRET" (fun () -> argv.[3])
+    let errorHandler = ProcessExiter(colorizer = function ErrorCode.HelpText -> None | _ -> Some ConsoleColor.Red)
+    let parser = ArgumentParser.Create<CLIArguments>(programName = "FsCrypto", errorHandler = errorHandler)
+    let parsedArgs = parser.ParseCommandLine(inputs = argv, raiseOnUsage = true)
 
-    use firiApi = new FiriApi(FiriSecrets.Create firiClientId firiSecret)
-    use coinbaseClient = new CoinbaseClient(new ApiKeyConfig(ApiKey=coinbaseApiKey, ApiSecret=coinbaseApiSecret))
+    let firiApiOpt =
+        parsedArgs.TryGetResult CLIArguments.Firi
+        |> Option.map (fun (firiClientId, firiSecret) ->
+            new FiriApi(FiriSecrets.Create firiClientId firiSecret))
 
-    let selectionPrompt =
-        let prompt = new SelectionPrompt<Selection>()
-        prompt.Title <- "[blue]What do you want to see?[/]"
-        prompt.AddChoices(
-            [|
-                Selection.Transactions
-                Selection.Balances
-                Selection.Quit
-            |]) |> ignore
-        prompt
+    let coinbaseClientOpt =
+        parsedArgs.TryGetResult CLIArguments.Coinbase
+        |> Option.map (fun (coinbaseApiKey, coinbaseApiSecret) ->
+            new CoinbaseClient(new ApiKeyConfig(ApiKey=coinbaseApiKey, ApiSecret=coinbaseApiSecret)))
 
-    let rec loop () = async {
+    if firiApiOpt.IsNone && firiApiOpt.IsNone then
+        let usage = parser.PrintUsage()
+        printfn "%s" usage
+    else
 
-        let choice = AnsiConsole.Prompt(selectionPrompt)
-        match choice with
-        | Selection.Transactions ->
-            let runner = Program.run firiApi coinbaseClient
-            do! showTransactions runner
-            return! loop ()
+        let selectionPrompt =
+            let prompt = new SelectionPrompt<Selection>()
+            prompt.Title <- "[blue]What do you want to see?[/]"
+            prompt.AddChoices(
+                [|
+                    Selection.Transactions
+                    Selection.Balances
+                    Selection.Quit
+                |]) |> ignore
+            prompt
 
-        | Selection.Balances ->
-            let runner = Program.run firiApi coinbaseClient
-            do! showBalances runner
-            return! loop ()
+        let rec loop () = async {
 
-        | Selection.Quit ->
-            ()
-        }
+            let choice = AnsiConsole.Prompt(selectionPrompt)
+            match choice with
+            | Selection.Transactions ->
+                let runner = Program.run firiApiOpt coinbaseClientOpt
+                do! showTransactions runner
+                return! loop ()
 
-    loop ()
-    |> Async.RunSynchronously
+            | Selection.Balances ->
+                let runner = Program.run firiApiOpt coinbaseClientOpt
+                do! showBalances runner
+                return! loop ()
+
+            | Selection.Quit ->
+                ()
+            }
+
+        loop ()
+        |> Async.RunSynchronously
 
     0 // return an integer exit code
